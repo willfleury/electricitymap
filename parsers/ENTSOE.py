@@ -1,6 +1,7 @@
 from bs4 import BeautifulSoup
 from collections import defaultdict
 import arrow, os, re, requests
+import pandas as pd
 
 ENTSOE_ENDPOINT = 'https://transparency.entsoe.eu/api'
 ENTSOE_PARAMETER_DESC = {
@@ -69,10 +70,16 @@ ENTSOE_DOMAIN_MAPPINGS = {
     'TR': '10YTR-TEIAS----W',
     'UA': '10Y1001A1001A869'
 }
-def query_ENTSOE(session, params):
+def query_ENTSOE_day(session, params):
     now = arrow.utcnow()
-    params['periodStart'] = now.replace(hours=-24).format('YYYYMMDDHH00')
-    params['periodEnd'] = now.replace(hours=+24).format('YYYYMMDDHH00')
+    start_date = now.replace(hours=-72)
+    end_date = now.replace(hours=+24)
+
+    return query_ENTSOE(session, params, start_date, end_date)
+
+def query_ENTSOE(session, params, start_date, end_date):
+    params['periodStart'] = start_date.format('YYYYMMDDHH00')
+    params['periodEnd'] = end_date.format('YYYYMMDDHH00')
     if not 'ENTSOE_TOKEN' in os.environ:
         raise Exception('No ENTSOE_TOKEN found! Please add it into secrets.env!')
     params['securityToken'] = os.environ['ENTSOE_TOKEN']
@@ -84,7 +91,8 @@ def query_consumption(domain, session):
         'processType': 'A16',
         'outBiddingZone_Domain': domain,
     }
-    response = query_ENTSOE(session, params)
+    response = query_ENTSOE_day(session, params)
+    
     if response.ok: return response.text
     else:
         # Grab the error if possible
@@ -100,7 +108,7 @@ def query_production(psr_type, in_domain, session):
         'processType': 'A16',
         'in_Domain': in_domain,
     }
-    response = query_ENTSOE(session, params)
+    response = query_ENTSOE_day(session, params)
     if response.ok: return response.text
     else:
         return # Return by default
@@ -111,13 +119,13 @@ def query_production(psr_type, in_domain, session):
         print 'Failed for psr %s' % psr_type
         print 'Reason:', error_text
 
-def query_exchange(in_domain, out_domain, session):
+def query_exchange(in_domain, out_domain, start_date, end_date, session):
     params = {
         'documentType': 'A11',
         'in_Domain': in_domain,
         'out_Domain': out_domain,
     }
-    response = query_ENTSOE(session, params)
+    response = query_ENTSOE(session, params, start_date, end_date)
     if response.ok: return response.text
     else:
         # Grab the error if possible
@@ -126,13 +134,13 @@ def query_exchange(in_domain, out_domain, session):
         if 'No matching data found' in error_text: return
         raise Exception('Failed to get exchange. Reason: %s' % error_text)
 
-def query_price(domain, session):
+def query_price(domain, start_date, end_date, session):
     params = {
         'documentType': 'A44',
         'in_Domain': domain,
         'out_Domain': domain,
     }
-    response = query_ENTSOE(session, params)
+    response = query_ENTSOE(session, params, start_date, end_date)
     if response.ok: return response.text
     else:
         # Grab the error if possible
@@ -287,16 +295,19 @@ def get_unknown(values):
 def fetch_consumption(country_code, session=None):
     if not session: session = requests.session()
     domain = ENTSOE_DOMAIN_MAPPINGS[country_code]
+
+    data = []
     # Grab consumption
     parsed = parse_consumption(query_consumption(domain, session))
     if parsed:
         quantities, datetimes = parsed
-        data = {
-            'countryCode': country_code,
-            'datetime': datetimes[-1].datetime,
-            'consumption': quantities[-1],
-            'source': 'entsoe.eu'
-        }
+        for i in range(len(datetimes)):
+            data.append({
+                'countryCode': country_code,
+                'datetime': datetimes[i].datetime,
+                'consumption': quantities[-1],
+                'source': 'entsoe.eu'
+            })
 
         return data
 
@@ -353,7 +364,7 @@ def fetch_production(country_code, session=None):
 
     return data
 
-def fetch_exchange(country_code1, country_code2, session=None):
+def fetch_exchange(country_code1, country_code2, start_date, end_date, session=None):
     if not session: session = requests.session()
     domain1 = ENTSOE_DOMAIN_MAPPINGS[country_code1]
     domain2 = ENTSOE_DOMAIN_MAPPINGS[country_code2]
@@ -362,12 +373,12 @@ def fetch_exchange(country_code1, country_code2, session=None):
     # Grab exchange
     # Import
     parsed = parse_exchange(
-        query_exchange(domain1, domain2, session),
+        query_exchange(domain1, domain2, start_date, end_date, session),
         is_import=True)
     if parsed:
         # Export
         parsed = parse_exchange(
-            xml_text=query_exchange(domain2, domain1, session),
+            xml_text=query_exchange(domain2, domain1, start_date, end_date, session),
             is_import=False, quantities=parsed[0], datetimes=parsed[1])
         if parsed:
             quantities, datetimes = parsed
@@ -383,6 +394,8 @@ def fetch_exchange(country_code1, country_code2, session=None):
     for exchange_date in exchange_dates:
         netFlow = exchange_hashmap[exchange_date]
         data.append({
+            'sourceCountry': sorted_country_codes[0],
+            'targetCountry': sorted_country_codes[1],
             'sortedCountryCodes': '->'.join(sorted_country_codes),
             'datetime': exchange_date.datetime,
             'netFlow': netFlow if country_code1[0] == sorted_country_codes else -1 * netFlow,
@@ -390,19 +403,15 @@ def fetch_exchange(country_code1, country_code2, session=None):
         })
     return data
 
-def fetch_price(country_code, session=None):
+def fetch_price(country_code, start_date, end_date, session=None):
     if not session: session = requests.session()
     domain = ENTSOE_DOMAIN_MAPPINGS[country_code]
     # Grab consumption
-    parsed = parse_price(query_price(domain, session))
+    parsed = parse_price(query_price(domain, start_date, end_date, session))
     if parsed:
         prices, currencies, datetimes = parsed
-        data = {
-            'countryCode': country_code,
-            'datetime': datetimes[-1].datetime,
-            'currency': currencies[-1],
-            'price': prices[-1],
-            'source': 'entsoe.eu'
-        }
 
-        return data
+        df = pd.DataFrame({'currency': currencies, 'price': prices, 'timestamp': datetimes})
+        df['timestamp'] = df['timestamp'].apply(lambda x: arrow.get(x).datetime)
+
+        return df
