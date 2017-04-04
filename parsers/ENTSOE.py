@@ -70,12 +70,6 @@ ENTSOE_DOMAIN_MAPPINGS = {
     'TR': '10YTR-TEIAS----W',
     'UA': '10Y1001A1001A869'
 }
-def query_ENTSOE_day(session, params):
-    now = arrow.utcnow()
-    start_date = now.replace(hours=-72)
-    end_date = now.replace(hours=+24)
-
-    return query_ENTSOE(session, params, start_date, end_date)
 
 def query_ENTSOE(session, params, start_date, end_date):
     params['periodStart'] = start_date.format('YYYYMMDDHH00')
@@ -85,13 +79,13 @@ def query_ENTSOE(session, params, start_date, end_date):
     params['securityToken'] = os.environ['ENTSOE_TOKEN']
     return session.get(ENTSOE_ENDPOINT, params=params)
     
-def query_consumption(domain, session):
+def query_consumption(domain, start_date, end_date, session):
     params = {
         'documentType': 'A65',
         'processType': 'A16',
         'outBiddingZone_Domain': domain,
     }
-    response = query_ENTSOE_day(session, params)
+    response = query_ENTSOE(session, params, start_date, end_date)
     
     if response.ok: return response.text
     else:
@@ -101,14 +95,14 @@ def query_consumption(domain, session):
         if 'No matching data found' in error_text: return
         raise Exception('Failed to get consumption. Reason: %s' % error_text)
 
-def query_production(psr_type, in_domain, session):
+def query_production(psr_type, in_domain, start_date, end_date, session):
     params = {
         'psrType': psr_type,
         'documentType': 'A75',
         'processType': 'A16',
         'in_Domain': in_domain,
     }
-    response = query_ENTSOE_day(session, params)
+    response = query_ENTSOE(session, params, start_date, end_date)
     if response.ok: return response.text
     else:
         return # Return by default
@@ -292,33 +286,32 @@ def get_unknown(values):
             values.get('Other renewable', 0) + \
             values.get('Other', 0)
 
-def fetch_consumption(country_code, session=None):
+def fetch_consumption(country_code, start_date, end_date, session=None):
     if not session: session = requests.session()
     domain = ENTSOE_DOMAIN_MAPPINGS[country_code]
 
     data = []
     # Grab consumption
-    parsed = parse_consumption(query_consumption(domain, session))
+    parsed = parse_consumption(query_consumption(domain, start_date, end_date, session))
     if parsed:
         quantities, datetimes = parsed
         for i in range(len(datetimes)):
             data.append({
                 'countryCode': country_code,
-                'datetime': datetimes[i].datetime,
-                'consumption': quantities[-1],
-                'source': 'entsoe.eu'
+                'timestamp': datetimes[i].datetime,
+                'consumption': quantities[i]
             })
 
-        return data
+        return pd.DataFrame(data)
 
-def fetch_production(country_code, session=None):
+def fetch_production(country_code, start_date, end_date, session=None):
     if not session: session = requests.session()
     domain = ENTSOE_DOMAIN_MAPPINGS[country_code]
     # Create a double hashmap with keys (datetime, parameter)
     production_hashmap = defaultdict(lambda: {})
     # Grab production
     for k in ENTSOE_PARAMETER_DESC.keys():
-        parsed = parse_production(query_production(k, domain, session))
+        parsed = parse_production(query_production(k, domain, start_date, end_date, session))
         if parsed:
             productions, storages, datetimes = parsed
             for i in range(len(datetimes)):
@@ -343,26 +336,21 @@ def fetch_production(country_code, session=None):
 
         data.append({
             'countryCode': country_code,
-            'datetime': production_date.datetime,
-            'production': {
-                'biomass': get_biomass(production_values),
-                'coal': get_coal(production_values),
-                'gas': get_gas(production_values),
-                'hydro': get_hydro(production_values),
-                'nuclear': production_values.get('Nuclear', None),
-                'oil': get_oil(production_values),
-                'solar': production_values.get('Solar', None),
-                'wind': get_wind(production_values),
-                'geothermal': get_geothermal(production_values),
-                'unknown': get_unknown(production_values)
-            },
-            'storage': {
-                'hydro': get_hydro_storage(storage_values),
-            },
-            'source': 'entsoe.eu'
+            'timestamp': production_date.datetime,
+            'prod.biomass': get_biomass(production_values),
+            'prod.coal': get_coal(production_values),
+            'prod.gas': get_gas(production_values),
+            'prod.hydro': get_hydro(production_values),
+            'prod.nuclear': production_values.get('Nuclear', None),
+            'prod.oil': get_oil(production_values),
+            'prod.solar': production_values.get('Solar', None),
+            'prod.wind': get_wind(production_values),
+            'prod.geothermal': get_geothermal(production_values),
+            'prod.unknown': get_unknown(production_values),
+            'storage.hydro': get_hydro_storage(storage_values)
         })
 
-    return data
+    return pd.DataFrame(data)
 
 def fetch_exchange(country_code1, country_code2, start_date, end_date, session=None):
     if not session: session = requests.session()
@@ -390,18 +378,22 @@ def fetch_exchange(country_code1, country_code2, start_date, end_date, session=N
     exchange_dates = sorted(set(exchange_hashmap.keys()), reverse=True)
     exchange_dates = filter(lambda x: x <= arrow.now(), exchange_dates)
     if not len(exchange_dates): return None
-    data = []
+
+    net_flows = []
+    timestamps = []
+    source_country = []
+    target_country = []
     for exchange_date in exchange_dates:
-        netFlow = exchange_hashmap[exchange_date]
-        data.append({
-            'sourceCountry': sorted_country_codes[0],
-            'targetCountry': sorted_country_codes[1],
-            'sortedCountryCodes': '->'.join(sorted_country_codes),
-            'datetime': exchange_date.datetime,
-            'netFlow': netFlow if country_code1[0] == sorted_country_codes else -1 * netFlow,
-            'source': 'entsoe.eu'
-        })
-    return data
+        net_flows.append(exchange_hashmap[exchange_date])
+        timestamps.append(exchange_date.datetime)
+        source_country.append(sorted_country_codes[0])
+        target_country.append(sorted_country_codes[1])
+
+    return pd.DataFrame({'country_from': source_country, 
+                      'country_to': target_country, 
+                      'timestamp': timestamps, 
+                      'net_flow': net_flows})
+
 
 def fetch_price(country_code, start_date, end_date, session=None):
     if not session: session = requests.session()

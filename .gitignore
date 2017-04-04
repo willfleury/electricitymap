@@ -1,5 +1,6 @@
 *.pyc
 *.env
+.cache/
 src
 web/public/dist
 web/node_modules

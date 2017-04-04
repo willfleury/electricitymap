@@ -23,8 +23,10 @@ def get_url(origin, horizon):
 
 def fetch_forecast(origin, horizon):
     print 'Fetching weather forecast of %s made at %s' % (horizon, origin)
+    url = get_url(origin, horizon)
+    print(url)
     subprocess.check_call(
-        ['wget', '-q', get_url(origin, horizon), '-O', TMP_FILENAME], shell=False)
+        ['wget', '-q', url, '-O', TMP_FILENAME], shell=False)
 
     with pygrib.open(TMP_FILENAME) as f:
         wind_u = f.select(name='10 metre U wind component')[0]
